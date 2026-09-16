@@ -36,6 +36,9 @@ android {
 }
 
 dependencies {
+    implementation("com.google.zxing:core:3.5.3")
+    implementation("androidx.compose.material:material-icons-core")
+    implementation("androidx.compose.material:material-icons-extended")
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)
