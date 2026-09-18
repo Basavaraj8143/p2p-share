@@ -5,6 +5,10 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -12,28 +16,29 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ContentPaste
-import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.FolderOpen
-import androidx.compose.material.icons.filled.Send
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.Surface
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import com.basavaraj.dropshare.model.ErrorReason
+import com.basavaraj.dropshare.model.TransferPhase
+import com.basavaraj.dropshare.model.TransferUiState
+import com.basavaraj.dropshare.ui.screens.HomeScreen
+import com.basavaraj.dropshare.ui.screens.ReceiveScreen
+import com.basavaraj.dropshare.ui.screens.SendScreen
+import com.basavaraj.dropshare.ui.theme.DropShareColors
 import com.basavaraj.dropshare.ui.theme.DropShareTheme
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.MultiFormatWriter
@@ -46,14 +51,320 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.URL
 
+private enum class Destination { Home, Send, Receive }
+
 class MainActivity : ComponentActivity() {
+
+    private var onBackPressedHandler: (() -> Boolean)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                val handled = onBackPressedHandler?.invoke() ?: false
+                if (!handled) {
+                    isEnabled = false
+                    onBackPressedDispatcher.onBackPressed()
+                }
+            }
+        })
+
         setContent {
             DropShareTheme {
-                DropShareApp()
+                Surface(modifier = Modifier.fillMaxSize(), color = DropShareColors.Background) {
+                    val context = LocalContext.current
+                    val clipboardManager = LocalClipboardManager.current
+
+                    var destination by remember { mutableStateOf(Destination.Home) }
+                    var sendState by remember { mutableStateOf(TransferUiState()) }
+                    var receiveState by remember { mutableStateOf(TransferUiState()) }
+                    var server by remember { mutableStateOf<FileServer?>(null) }
+                    var localIpAddress by remember { mutableStateOf(getLocalIpAddress()) }
+
+                    // Dynamic Network Observer for auto-syncing network state when Wi-Fi is toggled
+                    DisposableEffect(context) {
+                        val connectivityManager = context.getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager
+
+                        val networkCallback = object : ConnectivityManager.NetworkCallback() {
+                            override fun onAvailable(network: Network) {
+                                localIpAddress = getLocalIpAddress()
+                            }
+
+                            override fun onLost(network: Network) {
+                                localIpAddress = getLocalIpAddress()
+                            }
+
+                            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                                localIpAddress = getLocalIpAddress()
+                            }
+                        }
+
+                        val networkRequest = NetworkRequest.Builder()
+                            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                            .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                            .build()
+
+                        try {
+                            connectivityManager?.registerNetworkCallback(networkRequest, networkCallback)
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+
+                        onDispose {
+                            try {
+                                connectivityManager?.unregisterNetworkCallback(networkCallback)
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
+                        }
+                    }
+
+                    // Intercept back navigation at activity level
+                    DisposableEffect(destination) {
+                        onBackPressedHandler = {
+                            if (destination != Destination.Home) {
+                                if (destination == Destination.Send) {
+                                    val currentServer = server
+                                    Thread { currentServer?.stop() }.start()
+                                    server = null
+                                    sendState = TransferUiState()
+                                } else if (destination == Destination.Receive) {
+                                    receiveState = TransferUiState()
+                                }
+                                destination = Destination.Home
+                                true // Handled back press! Transition to Home
+                            } else {
+                                false // On Home screen: allow system back to exit app
+                            }
+                        }
+                        onDispose {
+                            onBackPressedHandler = null
+                        }
+                    }
+
+                    DisposableEffect(Unit) {
+                        onDispose {
+                            val currentServer = server
+                            Thread { currentServer?.stop() }.start()
+                        }
+                    }
+
+                    val filePicker = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.GetContent()
+                    ) { uri ->
+                        if (uri != null) {
+                            context.contentResolver.query(
+                                uri,
+                                arrayOf(
+                                    OpenableColumns.DISPLAY_NAME,
+                                    OpenableColumns.SIZE
+                                ),
+                                null,
+                                null,
+                                null
+                            )?.use { cursor ->
+                                if (cursor.moveToFirst()) {
+                                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+
+                                    val name = if (nameIndex >= 0 && !cursor.isNull(nameIndex)) {
+                                        cursor.getString(nameIndex)
+                                    } else {
+                                        "file"
+                                    }
+
+                                    val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
+                                        cursor.getLong(sizeIndex)
+                                    } else {
+                                        0L
+                                    }
+
+                                    val fileExt = name.substringAfterLast('.', "FILE").uppercase()
+
+                                    sendState = sendState.copy(
+                                        phase = TransferPhase.Ready,
+                                        fileName = name,
+                                        fileType = fileExt,
+                                        fileSizeBytes = size,
+                                        selectedUri = uri
+                                    )
+                                }
+                            }
+                        } else {
+                            if (sendState.phase == TransferPhase.Selecting) {
+                                sendState = sendState.copy(phase = TransferPhase.Idle)
+                            }
+                        }
+                    }
+
+                    val isOnLocalNetwork = localIpAddress != "Unknown IP"
+
+                    when (destination) {
+                        Destination.Home -> HomeScreen(
+                            isOnLocalNetwork = isOnLocalNetwork,
+                            onRefreshNetwork = {
+                                localIpAddress = getLocalIpAddress()
+                            },
+                            onSendClick = {
+                                destination = Destination.Send
+                                sendState = TransferUiState()
+                            },
+                            onReceiveClick = {
+                                destination = Destination.Receive
+                                receiveState = TransferUiState()
+                            },
+                        )
+
+                        Destination.Send -> SendScreen(
+                            state = sendState,
+                            onBackClick = {
+                                val currentServer = server
+                                Thread { currentServer?.stop() }.start()
+                                server = null
+                                sendState = TransferUiState()
+                                destination = Destination.Home
+                            },
+                            onPickFile = {
+                                sendState = sendState.copy(phase = TransferPhase.Selecting)
+                                filePicker.launch("*/*")
+                            },
+                            onStartSharing = {
+                                val uri = sendState.selectedUri
+                                if (uri != null && sendState.fileName != null) {
+                                    val serverInstance = FileServer(
+                                        fileName = sendState.fileName!!,
+                                        fileSize = sendState.fileSizeBytes ?: 0L
+                                    ) {
+                                        context.contentResolver.openInputStream(uri)
+                                    }
+
+                                    server = serverInstance
+                                    Thread { serverInstance.start() }.start()
+
+                                    val ipAddress = getLocalIpAddress()
+                                    val addressString = "http://$ipAddress:8080"
+                                    val qrBitmap = generateQrCode(addressString)?.asImageBitmap()
+
+                                    sendState = sendState.copy(
+                                        phase = TransferPhase.Waiting,
+                                        localIpAddress = ipAddress,
+                                        port = 8080,
+                                        qrCodeBitmap = qrBitmap
+                                    )
+                                }
+                            },
+                            onStopSharing = {
+                                val currentServer = server
+                                Thread { currentServer?.stop() }.start()
+                                server = null
+                                sendState = TransferUiState()
+                                destination = Destination.Home
+                            },
+                            onCancelTransfer = {
+                                val currentServer = server
+                                Thread { currentServer?.stop() }.start()
+                                server = null
+                                sendState = sendState.copy(phase = TransferPhase.Cancelled)
+                            },
+                            onRetry = {
+                                sendState = TransferUiState(phase = TransferPhase.Ready, selectedUri = sendState.selectedUri, fileName = sendState.fileName, fileType = sendState.fileType, fileSizeBytes = sendState.fileSizeBytes)
+                            },
+                            onDone = {
+                                val currentServer = server
+                                Thread { currentServer?.stop() }.start()
+                                server = null
+                                sendState = TransferUiState()
+                                destination = Destination.Home
+                            },
+                        )
+
+                        Destination.Receive -> ReceiveScreen(
+                            state = receiveState,
+                            onBackClick = {
+                                receiveState = TransferUiState()
+                                destination = Destination.Home
+                            },
+                            onAddressChange = { address ->
+                                receiveState = receiveState.copy(enteredAddress = address)
+                            },
+                            onPasteClick = {
+                                val clip = clipboardManager.getText()
+                                if (clip != null) {
+                                    receiveState = receiveState.copy(enteredAddress = clip.text)
+                                }
+                            },
+                            onConnectClick = {
+                                val address = receiveState.enteredAddress
+                                if (address.isNotBlank()) {
+                                    var startTime = System.currentTimeMillis()
+                                    downloadFile(
+                                        context = context,
+                                        urlString = address,
+                                        onStatusChange = { status ->
+                                            when (status) {
+                                                DownloadStatus.Connecting -> {
+                                                    startTime = System.currentTimeMillis()
+                                                    receiveState = receiveState.copy(phase = TransferPhase.Connecting)
+                                                }
+                                                is DownloadStatus.Downloading -> {
+                                                    val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
+                                                    val speed = if (elapsed > 0) (status.bytesDownloaded / elapsed).toLong() else 0L
+                                                    val remainingBytes = status.totalBytes - status.bytesDownloaded
+                                                    val eta = if (speed > 0) remainingBytes / speed else null
+
+                                                    val ext = status.fileName.substringAfterLast('.', "FILE").uppercase()
+
+                                                    receiveState = receiveState.copy(
+                                                        phase = TransferPhase.Transferring,
+                                                        fileName = status.fileName,
+                                                        fileType = ext,
+                                                        fileSizeBytes = status.totalBytes,
+                                                        bytesTransferred = status.bytesDownloaded,
+                                                        transferSpeedBytesPerSec = speed,
+                                                        etaSeconds = eta
+                                                    )
+                                                }
+                                                is DownloadStatus.Success -> {
+                                                    receiveState = receiveState.copy(
+                                                        phase = TransferPhase.Completed,
+                                                        fileName = status.fileName,
+                                                        downloadedUri = status.uri
+                                                    )
+                                                }
+                                                is DownloadStatus.Error -> {
+                                                    receiveState = receiveState.copy(
+                                                        phase = TransferPhase.Failed,
+                                                        error = ErrorReason.ConnectFailed
+                                                    )
+                                                }
+                                                DownloadStatus.Idle -> {
+                                                    receiveState = receiveState.copy(phase = TransferPhase.Idle)
+                                                }
+                                            }
+                                        }
+                                    )
+                                }
+                            },
+                            onCancelTransfer = {
+                                receiveState = receiveState.copy(phase = TransferPhase.Cancelled)
+                            },
+                            onOpenFile = {
+                                receiveState.downloadedUri?.let { uri ->
+                                    openDownloadedFile(context, uri)
+                                }
+                            },
+                            onRetry = {
+                                receiveState = TransferUiState(phase = TransferPhase.Idle, enteredAddress = receiveState.enteredAddress)
+                            },
+                            onDone = {
+                                receiveState = TransferUiState()
+                                destination = Destination.Home
+                            },
+                        )
+                    }
+                }
             }
         }
     }
@@ -70,466 +381,6 @@ sealed interface DownloadStatus {
     ) : DownloadStatus
     data class Success(val fileName: String, val uri: Uri) : DownloadStatus
     data class Error(val message: String) : DownloadStatus
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun DropShareApp() {
-    var selectedTab by remember { mutableIntStateOf(0) }
-
-    Scaffold(
-        topBar = {
-            Column {
-                CenterAlignedTopAppBar(
-                    title = {
-                        Text(
-                            text = "DropShare",
-                            style = MaterialTheme.typography.titleLarge
-                        )
-                    }
-                )
-                TabRow(selectedTabIndex = selectedTab) {
-                    Tab(
-                        selected = selectedTab == 0,
-                        onClick = { selectedTab = 0 },
-                        text = { Text("Send") },
-                        icon = { Icon(Icons.Default.Send, contentDescription = "Send") }
-                    )
-                    Tab(
-                        selected = selectedTab == 1,
-                        onClick = { selectedTab = 1 },
-                        text = { Text("Receive") },
-                        icon = { Icon(Icons.Default.Download, contentDescription = "Receive") }
-                    )
-                }
-            }
-        }
-    ) { paddingValues ->
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(paddingValues)
-        ) {
-            when (selectedTab) {
-                0 -> SendScreen()
-                1 -> ReceiveScreen()
-            }
-        }
-    }
-}
-
-@Composable
-fun SendScreen() {
-    val context = LocalContext.current
-
-    var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var selectedFileUri by remember { mutableStateOf<Uri?>(null) }
-    var fileName by remember { mutableStateOf("") }
-    var fileSize by remember { mutableStateOf("") }
-    var serverRunning by remember { mutableStateOf(false) }
-    var serverAddress by remember { mutableStateOf("") }
-    var server by remember { mutableStateOf<FileServer?>(null) }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            val currentServer = server
-            Thread {
-                currentServer?.stop()
-            }.start()
-        }
-    }
-
-    val filePicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri ->
-        if (uri != null) {
-            if (serverRunning) {
-                val currentServer = server
-                Thread {
-                    currentServer?.stop()
-                }.start()
-                server = null
-                qrBitmap = null
-                serverRunning = false
-            }
-
-            selectedFileUri = uri
-
-            context.contentResolver.query(
-                uri,
-                arrayOf(
-                    OpenableColumns.DISPLAY_NAME,
-                    OpenableColumns.SIZE
-                ),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-
-                    fileName = if (nameIndex >= 0 && !cursor.isNull(nameIndex)) {
-                        cursor.getString(nameIndex)
-                    } else {
-                        "Unknown file"
-                    }
-
-                    val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
-                        cursor.getLong(sizeIndex)
-                    } else {
-                        0L
-                    }
-
-                    fileSize = formatFileSize(size)
-                }
-            }
-        }
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(
-            text = "Share File Over Local Wi-Fi",
-            style = MaterialTheme.typography.titleMedium
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        Button(
-            onClick = {
-                filePicker.launch("*/*")
-            }
-        ) {
-            Text("Choose File")
-        }
-
-        selectedFileUri?.let { uri ->
-            Spacer(modifier = Modifier.height(24.dp))
-
-            Text(
-                text = "📄 $fileName",
-                style = MaterialTheme.typography.titleMedium
-            )
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Text(text = fileSize)
-
-            Spacer(modifier = Modifier.height(20.dp))
-
-            Button(
-                onClick = {
-                    if (!serverRunning) {
-                        val serverInstance = FileServer(
-                            fileName = fileName,
-                            fileSize = getFileSize(context, uri)
-                        ) {
-                            context.contentResolver.openInputStream(uri)
-                        }
-
-                        server = serverInstance
-
-                        Thread {
-                            serverInstance.start()
-                        }.start()
-
-                        serverRunning = true
-
-                        val ipAddress = getLocalIpAddress()
-                        serverAddress = "http://$ipAddress:8080"
-                        qrBitmap = generateQrCode(serverAddress)
-                    } else {
-                        val currentServer = server
-                        Thread {
-                            currentServer?.stop()
-                        }.start()
-                        server = null
-                        qrBitmap = null
-                        serverRunning = false
-                    }
-                }
-            ) {
-                Text(
-                    if (serverRunning) "Stop Sharing" else "Share File"
-                )
-            }
-
-            if (serverRunning) {
-                Spacer(modifier = Modifier.height(24.dp))
-
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Text(
-                            text = "Server Running",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        SelectionContainer {
-                            Text(
-                                text = serverAddress,
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        Text(
-                            text = "Open this address on the receiving device",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-
-                        qrBitmap?.let { bitmap ->
-                            Spacer(modifier = Modifier.height(16.dp))
-
-                            Image(
-                                bitmap = bitmap.asImageBitmap(),
-                                contentDescription = "QR Code",
-                                modifier = Modifier.size(200.dp)
-                            )
-
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            Text(
-                                text = "Scan QR code on receiving device",
-                                style = MaterialTheme.typography.labelMedium
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun ReceiveScreen() {
-    val context = LocalContext.current
-    val clipboardManager = LocalClipboardManager.current
-
-    var serverUrlInput by remember { mutableStateOf("") }
-    var downloadStatus by remember { mutableStateOf<DownloadStatus>(DownloadStatus.Idle) }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Top
-    ) {
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Text(
-            text = "Receive File",
-            style = MaterialTheme.typography.titleMedium
-        )
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Text(
-            text = "Enter the sender's address to download the shared file",
-            style = MaterialTheme.typography.bodyMedium
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        OutlinedTextField(
-            value = serverUrlInput,
-            onValueChange = { serverUrlInput = it },
-            label = { Text("Sender Address") },
-            placeholder = { Text("http://192.168.1.x:8080") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-            trailingIcon = {
-                IconButton(
-                    onClick = {
-                        val clip = clipboardManager.getText()
-                        if (clip != null) {
-                            serverUrlInput = clip.text
-                        }
-                    }
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.ContentPaste,
-                        contentDescription = "Paste Address"
-                    )
-                }
-            }
-        )
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Button(
-            onClick = {
-                if (serverUrlInput.isNotBlank()) {
-                    downloadFile(
-                        context = context,
-                        urlString = serverUrlInput,
-                        onStatusChange = { status ->
-                            downloadStatus = status
-                        }
-                    )
-                }
-            },
-            enabled = serverUrlInput.isNotBlank() && downloadStatus !is DownloadStatus.Connecting && downloadStatus !is DownloadStatus.Downloading,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Icon(Icons.Default.Download, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Download File")
-        }
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        when (val status = downloadStatus) {
-            DownloadStatus.Idle -> {
-                // Idle state
-            }
-
-            DownloadStatus.Connecting -> {
-                Card(
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier.padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        CircularProgressIndicator(modifier = Modifier.size(24.dp))
-                        Spacer(modifier = Modifier.width(16.dp))
-                        Text("Connecting to server...")
-                    }
-                }
-            }
-
-            is DownloadStatus.Downloading -> {
-                Card(
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp)
-                    ) {
-                        Text(
-                            text = "Downloading: ${status.fileName}",
-                            style = MaterialTheme.typography.titleSmall
-                        )
-
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        if (status.progress >= 0f) {
-                            LinearProgressIndicator(
-                                progress = { status.progress },
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        } else {
-                            LinearProgressIndicator(
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        val formattedDownloaded = formatFileSize(status.bytesDownloaded)
-                        val formattedTotal = if (status.totalBytes > 0) formatFileSize(status.totalBytes) else "Unknown"
-
-                        Text(
-                            text = "$formattedDownloaded / $formattedTotal",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
-            }
-
-            is DownloadStatus.Success -> {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Text(
-                            text = "✅ File Received Successfully!",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        Text(
-                            text = status.fileName,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        Text(
-                            text = "Saved to Downloads",
-                            style = MaterialTheme.typography.labelSmall
-                        )
-
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        Button(
-                            onClick = {
-                                openDownloadedFile(context, status.uri)
-                            }
-                        ) {
-                            Icon(Icons.Default.FolderOpen, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Open File")
-                        }
-                    }
-                }
-            }
-
-            is DownloadStatus.Error -> {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp)
-                    ) {
-                        Text(
-                            text = "❌ Download Failed",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.onErrorContainer
-                        )
-
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        Text(
-                            text = status.message,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onErrorContainer
-                        )
-                    }
-                }
-            }
-        }
-    }
 }
 
 fun downloadFile(
@@ -726,32 +577,6 @@ fun generateQrCode(text: String): Bitmap? {
     }
 }
 
-fun getFileSize(
-    context: Context,
-    uri: Uri
-): Long {
-    try {
-        context.contentResolver.query(
-            uri,
-            arrayOf(OpenableColumns.SIZE),
-            null,
-            null,
-            null
-        )?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                val index = cursor.getColumnIndex(OpenableColumns.SIZE)
-                if (index >= 0 && !cursor.isNull(index)) {
-                    return cursor.getLong(index)
-                }
-            }
-        }
-    } catch (e: Exception) {
-        e.printStackTrace()
-    }
-
-    return 0L
-}
-
 fun getLocalIpAddress(): String {
     try {
         val interfaces = NetworkInterface.getNetworkInterfaces() ?: return "Unknown IP"
@@ -781,12 +606,4 @@ fun getLocalIpAddress(): String {
     }
 
     return "Unknown IP"
-}
-
-fun formatFileSize(bytes: Long): String {
-    if (bytes < 0) return "Unknown"
-    if (bytes < 1024) return "$bytes B"
-    if (bytes < 1024 * 1024) return "%.2f KB".format(bytes / 1024.0)
-    if (bytes < 1024 * 1024 * 1024) return "%.2f MB".format(bytes / (1024.0 * 1024.0))
-    return "%.2f GB".format(bytes / (1024.0 * 1024.0 * 1024.0))
 }
